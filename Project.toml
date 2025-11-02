@@ -1,0 +1,4 @@
+name = "EES_UETP"
+uuid = "3296591c-f2b0-4c6d-9cbd-0c17c8d116aa"
+authors = ["GiacomoBastianel <91736508+GiacomoBastianel@users.noreply.github.com>"]
+version = "0.1.0"
