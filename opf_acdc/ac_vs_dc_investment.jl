@@ -1,0 +1,252 @@
+## Step 0: Activate environment
+using Pkg
+Pkg.activate(@__DIR__)
+Pkg.instantiate()
+Pkg.update()
+#Pkg.add("Ipopt")
+#Pkg.add("HiGHS")
+#Pkg.add("Juniper")
+#Pkg.add("PowerModels")
+#Pkg.add("PowerModelsACDC")
+#Pkg.add("JuMP")
+Pkg.add("StatsPlots")
+#Pkg.add("Plots") # if Plots package not added yet, for plotting results
+
+using PowerModels, PowerModelsACDC, Ipopt, JuMP, HiGHS, Juniper
+using StatsPlots, Plots
+
+# Define solver
+ipopt = optimizer_with_attributes(Ipopt.Optimizer)
+highs = optimizer_with_attributes(HiGHS.Optimizer)
+juniper = optimizer_with_attributes(Juniper.Optimizer, "nl_solver" => ipopt, "mip_solver" => highs)
+
+##### Step 1: Import the grid data and initialize the JuMP model
+# Select the MATPOWER case file
+path = pwd()
+case_file_ac = joinpath(path, "opf_ac", "pg", "case67_investment_ac.m")
+case_file_acdc = joinpath(path, "opf_acdc", "pg", "case67_investment_dc.m")
+case_file_acdc_tnep = joinpath(path, "tnep_acdc", "pg", "case67_investment_dc.m")
+
+# For convenience, use the parser of Powermodels to convert the MATPOWER format file to a Julia dictionary
+data_ac = PowerModels.parse_file(case_file_ac)
+data_acdc = PowerModels.parse_file(case_file_acdc)
+data_acdc_tnep = PowerModels.parse_file(case_file_acdc_tnep)
+
+
+# Initialize the JuMP model (an empty JuMP model) with defined solver
+m_ac = Model(ipopt)
+m_acdc = Model(ipopt)
+m_acdc_tnep = Model(juniper)
+
+##### Step 2: create the JuMP model & pass data to model
+include(joinpath(path, "opf_ac", "init_model.jl")) # Define functions define_sets! and process_parameters!
+define_sets!(m_ac, data_ac) # Pass the sets to the JuMP model
+process_parameters!(m_ac, data_ac) # Pass the parameters to the JuMP model
+
+include(joinpath(path, "opf_acdc", "init_model.jl"))# Define functions define_sets! and process_parameters!
+define_sets!(m_acdc, data_acdc) # Pass the sets to the JuMP model
+process_parameters!(m_acdc, data_acdc) # Pass the parameters to the JuMP model
+
+###### Adding candidates
+data_acdc_tnep["branchdc_cand"] = Dict{String, Any}() # Initialize the dictionary for DC branch candidates
+data_acdc_tnep["convdc_cand"] = Dict{String, Any}() # Initialize the dictionary for DC converter candidates
+
+include(joinpath(path, "tnep_acdc", "add_candidates.jl")) # Define function add_dc_branch_cand! and add_dc_converter_cand!
+add_converter_candidate!(data_acdc_tnep, 3, 3, 1000.0, 1.0; zone = nothing, islcc = 0, conv_id = 1, status = 1)
+add_converter_candidate!(data_acdc_tnep, 8, 8, 1000.0, 1.0; zone = nothing, islcc = 0, conv_id = 2, status = 1)
+add_dc_branch_cand!(data_acdc_tnep, 3, 8, 1000.0, 1.0; status = 1, r = 0.1, branch_id = 1)
+
+include(joinpath(path, "tnep_acdc", "init_model.jl"))# Define functions define_sets! and process_parameters!
+define_sets!(m_acdc_tnep, data_acdc_tnep) # Pass the sets to the JuMP model
+process_parameters!(m_acdc_tnep, data_acdc_tnep) # Pass the parameters to the JuMP model
+
+
+##### Step 3: Build the model
+include(joinpath(path, "opf_ac", "build_ac_opf.jl")) # Define build_ac_opf_acdc! function
+build_ac_opf!(m_ac) # Pass the model to the build_ac_opf_acdc! function
+include(joinpath(path, "opf_acdc","build_ac_opf_acdc.jl")) # Define build_ac_opf_acdc! function
+build_ac_opf_acdc!(m_acdc) # Pass the model to the build_ac_opf_acdc! function
+
+include(joinpath(path, "tnep_acdc","build_ac_tnep_acdc.jl")) # Define build_ac_opf_acdc! function
+build_ac_tnep_acdc!(m_acdc_tnep) # Build the AC TNEP part in the ACDC model
+
+##### Step 4: Solve the model
+optimize!(m_ac) # Solve the model
+optimize!(m_acdc) # Solve the model
+optimize!(m_acdc_tnep) # Solve the model
+
+##### Compare the two objective functions
+print(Dict("objective ac grid" => objective_value(m_ac),
+"objective acdc grid" => objective_value(m_acdc), 
+"objective tnep in acdc grid" => objective_value(m_acdc_tnep), 
+"ΔCost ac - acdc grid" => (objective_value(m_ac) - objective_value(m_acdc)))) # Compare the objective values
+"ΔCost acdc - test acdc grid" => (objective_value(m_acdc) - objective_value(m_acdc_tnep)) # Compare the objective values
+
+#####
+
+function create_results_dictionary(model,data)
+    results = Dict{String, Any}()
+    results["status"] = termination_status(model)
+    results["objective"] = objective_value(model)
+    results["solution"] = Dict{String, Any}()
+    results["solution"]["bus"] = Dict{String, Any}()
+    results["solution"]["branch"] = Dict{String, Any}()
+    results["solution"]["gen"] = Dict{String, Any}()
+
+    if haskey(data,"busdc")
+        results["solution"]["busdc"] = Dict{String, Any}()
+        results["solution"]["branchdc"] = Dict{String, Any}()
+        results["solution"]["convdc"] = Dict{String, Any}()
+    end
+
+    for (g_id,g) in data["gen"] 
+        results["solution"]["gen"][g_id] = Dict{String, Any}()
+        active_power = value(model.ext[:variables][:pg])
+        reactive_power = value(model.ext[:variables][:qg])
+        results["solution"]["gen"][g_id]["pg"] = active_power[g_id]
+        results["solution"]["gen"][g_id]["qg"] = reactive_power[g_id]
+    end
+
+    for (b_id,b) in data["bus"] 
+        results["solution"]["bus"][b_id] = Dict{String, Any}()
+        voltage_magnitudes = value(model.ext[:variables][:vm])
+        voltage_angles = value(model.ext[:variables][:va])
+        results["solution"]["bus"][b_id]["vm"] = voltage_magnitudes[b_id]
+        results["solution"]["bus"][b_id]["va"] = voltage_angles[b_id]
+    end
+
+    for (d,e,f) in model.ext[:sets][:B_ac_fr]
+        results["solution"]["branch"][d] = Dict{String, Any}()
+        active_power = value(model.ext[:variables][:pb])
+        results["solution"]["branch"][d]["pf"] = active_power[(d,e,f)]
+        reactive_power = value(model.ext[:variables][:qb])
+        results["solution"]["branch"][d]["qf"] = reactive_power[(d,e,f)]
+    end
+    for (d,f,e) in model.ext[:sets][:B_ac_to]
+        active_power = value(model.ext[:variables][:pb])
+        results["solution"]["branch"][d]["pt"] = active_power[(d,f,e)]
+        reactive_power = value(model.ext[:variables][:qb])
+        results["solution"]["branch"][d]["qt"] = reactive_power[(d,f,e)]
+    end
+
+    if haskey(data,"busdc")
+        for (b_id,b) in data["busdc"] 
+            results["solution"]["busdc"][b_id] = Dict{String, Any}()
+            voltage_magnitudes = value(model.ext[:variables][:busdc_vm])
+            results["solution"]["busdc"][b_id]["vm"] = voltage_magnitudes[b_id]
+        end
+        for (d,e,f) in model.ext[:sets][:BD_dc_fr]
+            results["solution"]["branchdc"][d] = Dict{String, Any}()
+            active_power = value(model.ext[:variables][:brdc_p])
+            results["solution"]["branchdc"][d]["pf"] = active_power[(d,e,f)]
+        end
+        for (d,f,e) in model.ext[:sets][:BD_dc_to]
+            active_power = value(model.ext[:variables][:brdc_p])
+            results["solution"]["branchdc"][d]["pt"] = active_power[(d,f,e)]
+        end
+        for (cv_id,cv) in data["convdc"] 
+            results["solution"]["convdc"][cv_id] = Dict{String, Any}()
+            res_conv_p_ac = value(model.ext[:variables][:conv_p_ac])
+            res_conv_q_ac = value(model.ext[:variables][:conv_q_ac])
+            res_conv_p_dc = value(model.ext[:variables][:conv_p_dc])
+            res_conv_p_ac_grid = value(model.ext[:variables][:conv_p_ac_grid])
+            res_conv_q_ac_grid = value(model.ext[:variables][:conv_q_ac_grid])
+            results["solution"]["convdc"][cv_id]["conv_p_ac"] = res_conv_p_ac[cv_id]
+            results["solution"]["convdc"][cv_id]["conv_q_ac"] = res_conv_q_ac[cv_id]
+            results["solution"]["convdc"][cv_id]["conv_p_dc"] = res_conv_p_dc[cv_id]
+            results["solution"]["convdc"][cv_id]["conv_p_ac_grid"] = res_conv_p_ac_grid[cv_id]
+            results["solution"]["convdc"][cv_id]["conv_q_ac_grid"] = res_conv_q_ac_grid[cv_id]
+        end
+        if haskey(data,"convdc_cand")
+            results["solution"]["convdc_cand"] = Dict{String, Any}()
+            for (cv_id,cv) in data["convdc_cand"] 
+                results["solution"]["convdc_cand"][cv_id] = Dict{String, Any}()
+                res_conv_p_ac_cand_bin = value(model.ext[:variables][:conv_p_cand_bin])
+                res_conv_p_dc_cand = value(model.ext[:variables][:conv_p_dc_cand])
+                res_conv_p_ac_cand = value(model.ext[:variables][:conv_p_ac_cand])
+                res_conv_q_ac_cand = value(model.ext[:variables][:conv_q_ac_cand])
+                results["solution"]["convdc_cand"][cv_id]["built"] = [cv_id]
+                results["solution"]["convdc_cand"][cv_id]["built"] = res_conv_p_ac_cand_bin[cv_id]
+                results["solution"]["convdc_cand"][cv_id]["conv_p_dc_cand"] = res_conv_p_dc_cand[cv_id]
+                results["solution"]["convdc_cand"][cv_id]["conv_p_ac_cand"] = res_conv_p_ac_cand[cv_id]
+                results["solution"]["convdc_cand"][cv_id]["conv_q_ac_cand"] = res_conv_q_ac_cand[cv_id]
+            end
+        end
+        if haskey(data,"branchdc_cand")
+            results["solution"]["branchdc_cand"] = Dict{String, Any}()
+            for (d,e,f) in model.ext[:sets][:BD_dc_cand_fr]
+                results["solution"]["branchdc_cand"][d] = Dict{String, Any}()
+                res_brdc_p_cand_bin = value(model.ext[:variables][:brdc_p_cand_bin])
+                res_brdc_p_cand = value(model.ext[:variables][:brdc_p_cand])
+                results["solution"]["branchdc_cand"][d]["built"] = res_brdc_p_cand_bin[(d,e,f)]
+                results["solution"]["branchdc_cand"][d]["brdc_p_cand"] = res_brdc_p_cand[(d,e,f)]
+            end
+        end
+    end
+    return results
+end
+
+
+result_pm = PowerModels.solve_opf(data_ac, ACPPowerModel, ipopt)
+result_ac_dict = create_results_dictionary(m_ac,data_ac)
+result_ac_dc_dict = create_results_dictionary(m_acdc,data_acdc)
+result_ac_dc_tnep_dict = create_results_dictionary(m_acdc_tnep,data_acdc_tnep)
+
+
+
+
+res_brdc_p_cand_bin = value(m_acdc_tnep.ext[:variables][:brdc_p_cand_bin])
+
+########################
+
+function plot_AC_branch_utilization(data, result, label)
+    br_utilization = [abs(result["solution"]["branch"]["$br_id"]["pf"])/data["branch"]["$br_id"]["rate_a"]*100 for br_id in 1:length(data["branch"])]
+    
+    sx = repeat(["$label"], inner = length(data["branch"]))
+    number = collect(1:length(data["branch"]))
+    #name = vcat(name_try, )
+
+    groupedbar(number, br_utilization, group = sx, ylabel = "Branch utilization [%]", xlabel = "Branch number", xticks = 1:1:length(data["branch"]), yticks = 0:20:100, ylims = (0,101), xlims = (0.5,length(data["branch"])+0.5),
+    title = "", bar_width = 0.7, color = [:grey70], xtickfont = 2)
+end
+
+function compare_branch_utilization(data, result_1, result_2, label_1, label_2)
+    br_utilization_1 = [abs(result_1["solution"]["branch"]["$br_id"]["pf"])/data["branch"]["$br_id"]["rate_a"]*100 for br_id in 1:length(data["branch"])]
+    br_utilization_2 = [abs(result_2["solution"]["branch"]["$br_id"]["pf"])/data["branch"]["$br_id"]["rate_a"]*100 for br_id in 1:length(data["branch"])]
+    
+    sx = repeat(["$label_1","$label_2"], inner = length(data["branch"]))
+    number = collect(1:length(data["branch"]))
+    numbers = vcat(number, number)
+    br_utilization = vcat(br_utilization_1, br_utilization_2)
+
+    groupedbar(numbers, br_utilization, group = sx, ylabel = "Branch utilization [%]", xlabel = "AC branch number", xticks = 1:1:length(data["branch"]), yticks = 0:20:100, ylims = (0,101), xlims = (0.5,length(data["branch"])+0.5),
+    title = "", bar_width = 0.7, color = [:grey40 :grey70], xtickfont = 2)
+end
+compare_branch_utilization(data_acdc, result_ac_dict, result_ac_dc_dict, "AC OPF", "ACDC OPF")
+
+function plot_DC_branch_utilization(data, result, label)
+    br_utilization = [abs(result["solution"]["branchdc"]["$br_id"]["pf"])/(data["branchdc"]["$br_id"]["rateA"]/data["baseMVA"])*100 for br_id in 1:length(data["branchdc"])]
+    
+    sx = repeat(["$label"], inner = length(data["branchdc"]))
+    number = collect(1:length(data["branchdc"]))
+    #name = vcat(name_try, )
+
+    groupedbar(number, br_utilization, group = sx, ylabel = "DC branch utilization [%]", xlabel = "DC branch number", xticks = 1:1:length(data["branchdc"]), yticks = 0:20:100, ylims = (0,101), xlims = (0.5,length(data["branchdc"])+0.5),
+    title = "", bar_width = 0.7, color = [:grey70], xtickfont = 2)
+end
+plot_DC_branch_utilization(data_acdc, result_ac_dc_dict, "ACDC OPF")
+
+
+function compare_DC_branch_utilization(data, result_1, result_2, label_1, label_2)
+    br_utilization_1 = [abs(result_1["solution"]["branchdc"]["$br_id"]["pf"])/(data["branchdc"]["$br_id"]["rateA"]/data["baseMVA"])*100 for br_id in 1:length(data["branchdc"])]
+    br_utilization_2 = [abs(result_2["solution"]["branchdc"]["$br_id"]["pf"])/(data["branchdc"]["$br_id"]["rateA"]/data["baseMVA"])*100 for br_id in 1:length(data["branchdc"])]
+    
+    sx = repeat(["$label_1","$label_2"], inner = length(data["branchdc"]))
+    number = collect(1:length(data["branchdc"]))
+    numbers = vcat(number, number)
+    br_utilization = vcat(br_utilization_1, br_utilization_2)
+
+    groupedbar(numbers, br_utilization, group = sx, ylabel = "DC branch utilization [%]", xlabel = "DC branch number", xticks = 1:1:length(data["branchdc"]), yticks = 0:20:100, ylims = (0,101), xlims = (0.5,length(data["branchdc"])+0.5),
+    title = "", bar_width = 0.7, color = [:grey40 :grey70], xtickfont = 2)
+end
+compare_DC_branch_utilization(data_acdc, result_ac_dc_dict, result_ac_dc_tnep_dict, "ACDC OPF", "ACDC TNEP")
